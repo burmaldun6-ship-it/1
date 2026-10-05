@@ -1,8 +1,8 @@
-import asyncio
 import logging
 import re
-from datetime import date
+from datetime import datetime
 from io import BytesIO
+from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -19,50 +19,59 @@ logger = logging.getLogger(__name__)
 
 START_TEXT = """Привет! Я бот для быстрого составления жалоб на форум Black Russia.
 
-Как пользоваться (всё одним сообщением):
+Как пользоваться:
 
-1. Сделай скриншот нарушения (обязательно с /time)
+1. Сделай скриншот нарушения (обязательно с /time).
 
-2. Залей его на фотохостинг (Imgur, Yapx, iBB и т.д.)
+2. Залей скриншот на фотохостинг (Imgur, Yapx, iBB и т.д.).
 
-3. Отправь мне одним сообщением:
+3. Прикрепи фото к сообщению боту и в подписи укажи строго 3 строки:
 
-• Прикреплённое фото
-• В подписи к фото напиши строго:
-
-Nickname:твой_ник
-Link:https://ссылка-на-фотохостинг
+Ваш ник:Cat_Boy
+Ссылка на фото:https://ibb.co/iajqn
+На какого игрока писать жалобу(ник):Cat_Male
 
 Пример:
-Nickname:мяу_мяу
-Link:https://ibb.co/abc123
+
+Ваш ник:Cat_Boy
+Ссылка на фото:https://ibb.co/abc123
+На какого игрока писать жалобу(ник):Cat_Male
 
 Важно:
-• Ник только в формате имя_фамилия (обе части с БОЛЬШОЙ буквы)
-• Лимит — 5 жалоб в сутки
-• Без даты и времени на скрине жалоба не пройдёт
+• Все ники — только латиницей.
+• Формат ника: Имя_Фамилия, обе части с большой буквы.
+• Указывай именно того игрока, на которого нужно писать жалобу.
+• Ссылка на фото должна вести на загруженный скриншот.
+• Лимит — 5 жалоб в сутки.
+• Без даты и времени (/time) на скрине жалоба не пройдёт.
 
-Кидай скрин — я составлю жалобу."""
+Кидай скрин — я проверю именно указанного игрока и составлю жалобу, только если нарушение действительно видно.
+"""
 
 NICK_RE = re.compile(r"^[A-Z][a-z]*_[A-Z][a-z]*$")
 CAPTION_RE = re.compile(
-    r"^\s*Nickname\s*:\s*(?P<nickname>[^\n]+?)\s*\n\s*Link\s*:\s*(?P<link>https?://\S+)\s*$",
+    r"^\s*Ваш\s+ник\s*:\s*(?P<nickname>[^\n]+?)\s*\n"
+    r"\s*Ссылка\s+на\s+фото\s*:\s*(?P<link>https?://\S+)\s*\n"
+    r"\s*На\s+какого\s+игрока\s+писать\s+жалобу\s*\(\s*ник\s*\)\s*:\s*(?P<target_nickname>[^\n]+?)\s*$",
     re.IGNORECASE,
 )
-
 
 class AdminStates(StatesGroup):
     waiting_user_limit = State()
     waiting_global_limit = State()
 
 
-def parse_caption(caption: str | None) -> tuple[str, str] | None:
+def parse_caption(caption: str | None) -> tuple[str, str, str] | None:
     if not caption:
         return None
     match = CAPTION_RE.match(caption)
     if not match:
         return None
-    return match.group("nickname").strip(), match.group("link").strip()
+    return (
+        match.group("nickname").strip(),
+        match.group("link").strip(),
+        match.group("target_nickname").strip(),
+    )
 
 
 def valid_nickname(nickname: str) -> bool:
@@ -219,29 +228,31 @@ async def complaint_handler(message: Message, bot, db: Database) -> None:
     parsed = parse_caption(message.caption)
     if parsed is None:
         await message.answer(
-            "❌ Неверная подпись. Отправь <b>одно фото</b> с подписью ровно в формате:\n\n"
-            "<code>Nickname:Abc_Dfs\nLink:https://example.com/...</code>"
+            "❌ Неверная подпись. Прикрепи одно фото и укажи в подписи ровно 3 строки:\n\n"
+            "<code>Ваш ник:Cat_Boy\n"
+            "Ссылка на фото:https://ibb.co/abc123\n"
+            "На какого игрока писать жалобу(ник):Cat_Male</code>"
         )
         return
 
-    nickname, link = parsed
-    if not valid_nickname(nickname):
+    nickname, link, target_nickname = parsed
+    if not valid_nickname(nickname) or not valid_nickname(target_nickname):
         await message.answer(
-            "❌ Некорректный Nickname. Нужен только латинский формат "
-            "<code>Abc_Dfs</code>: ровно одна нижняя черта, две части, "
+            "❌ Некорректный ник. Все ники должны быть только латиницей в формате "
+            "<code>Cat_Boy</code>: одна нижняя черта, две части, "
             "каждая начинается с заглавной буквы."
         )
         return
 
     admin = user.id == settings.admin_id
-    today = date.today().isoformat()
+    moscow_date = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
     reserved = False
 
     if not admin:
         limit = await db.get_limit(user.id, settings.default_daily_limit)
-        reserved = await db.reserve_slot(user.id, limit, today)
+        reserved = await db.reserve_slot(user.id, limit, moscow_date)
         if not reserved:
-            count = await db.get_successful_count(user.id, today)
+            count = await db.get_successful_count(user.id, moscow_date)
             await message.answer(
                 f"❌ Дневной лимит исчерпан: <b>{count}/{limit}</b>. "
                 "Новые успешные жалобы будут доступны завтра."
@@ -250,8 +261,9 @@ async def complaint_handler(message: Message, bot, db: Database) -> None:
 
     request_text = (
         f"Telegram user: {user.full_name} | id={user.id}\n"
-        f"Nickname: {nickname}\n"
-        f"Link: {link}\n"
+        f"Ваш ник: {nickname}\n"
+        f"Ссылка на фото: {link}\n"
+        f"На какого игрока писать жалобу(ник): {target_nickname}\n"
         "Image: attached Telegram photo"
     )
 
@@ -269,7 +281,12 @@ async def complaint_handler(message: Message, bot, db: Database) -> None:
             base_url=settings.openai_base_url,
             model=settings.openai_model,
         )
-        response = await ai.analyze(image_bytes, nickname, link)
+        response = await ai.analyze(
+            image_bytes,
+            nickname,
+            link,
+            target_nickname,
+        )
 
         await db.log_ai_call(
             user_id=user.id,
@@ -281,10 +298,8 @@ async def complaint_handler(message: Message, bot, db: Database) -> None:
             error_text=None,
         )
 
-        # Лимит считается именно по успешным обращениям, а не по попыткам.
-        # Для админа счётчик намеренно не увеличивается.
         if reserved:
-            await db.finalize_success(user.id, today)
+            await db.finalize_success(user.id, moscow_date)
 
         await status.delete()
         for offset in range(0, len(response), 4000):
@@ -292,7 +307,7 @@ async def complaint_handler(message: Message, bot, db: Database) -> None:
     except Exception as exc:
         logger.exception("AI request failed for user %s", user.id)
         if reserved:
-            await db.release_slot(user.id, today)
+            await db.release_slot(user.id, moscow_date)
 
         await db.log_ai_call(
             user_id=user.id,
@@ -317,5 +332,7 @@ async def unsupported_message_handler(message: Message) -> None:
 
     await message.answer(
         "Я принимаю только <b>одно фото с подписью</b> в формате:\n\n"
-        "<code>Nickname:Abc_Dfs\nLink:https://example.com/...</code>"
+        "<code>Ваш ник:Cat_Boy\n"
+        "Ссылка на фото:https://ibb.co/abc123\n"
+        "На какого игрока писать жалобу(ник):Cat_Male</code>"
     )
