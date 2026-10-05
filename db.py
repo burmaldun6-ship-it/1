@@ -22,6 +22,7 @@ class Database:
                 user_id INTEGER NOT NULL,
                 usage_date TEXT NOT NULL,
                 successful_count INTEGER NOT NULL DEFAULT 0,
+                reserved_count INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (user_id, usage_date)
             );
 
@@ -48,7 +49,16 @@ class Database:
             );
             """
         )
+        columns = await self._get_columns("usage")
+        if "reserved_count" not in columns:
+            await self.conn.execute("ALTER TABLE usage ADD COLUMN reserved_count INTEGER NOT NULL DEFAULT 0")
         await self.conn.commit()
+
+    async def _get_columns(self, table: str) -> set[str]:
+        assert self.conn is not None
+        async with self.conn.execute(f"PRAGMA table_info({table})") as cursor:
+            rows = await cursor.fetchall()
+        return {row["name"] for row in rows}
 
     async def close(self) -> None:
         if self.conn:
@@ -112,35 +122,57 @@ class Database:
         )
         return int(row["successful_count"]) if row else 0
 
-    async def try_reserve_slot(
-        self,
-        user_id: int,
-        limit: int,
-        usage_date: str | None = None,
-    ) -> bool:
-        """Атомарно проверяет дневной лимит до вызова ИИ.
-
-        Резервация не увеличивает successful_count: счётчик меняется
-        только после успешного ответа ИИ.
-        """
+    async def reserve_slot(self, user_id: int, limit: int, usage_date: str | None = None) -> bool:
+        """Атомарно резервирует один слот на время AI-запроса."""
         usage_date = usage_date or date.today().isoformat()
         if limit <= 0:
             return False
-
+        assert self.conn is not None
         async with self.lock:
-            current = await self.get_successful_count(user_id, usage_date)
-            return current < limit
+            row = await self._fetchone(
+                "SELECT successful_count, reserved_count FROM usage WHERE user_id = ? AND usage_date = ?",
+                (user_id, usage_date),
+            )
+            successful = int(row["successful_count"]) if row else 0
+            reserved = int(row["reserved_count"]) if row else 0
+            if successful + reserved >= limit:
+                return False
+            await self.conn.execute(
+                """
+                INSERT INTO usage(user_id, usage_date, successful_count, reserved_count)
+                VALUES(?, ?, 0, 1)
+                ON CONFLICT(user_id, usage_date)
+                DO UPDATE SET reserved_count = reserved_count + 1
+                """,
+                (user_id, usage_date),
+            )
+            await self.conn.commit()
+            return True
 
-    async def increment_successful(self, user_id: int, usage_date: str | None = None) -> None:
+    async def finalize_success(self, user_id: int, usage_date: str | None = None) -> None:
         usage_date = usage_date or date.today().isoformat()
         assert self.conn is not None
         async with self.lock:
             await self.conn.execute(
                 """
-                INSERT INTO usage(user_id, usage_date, successful_count)
-                VALUES(?, ?, 1)
-                ON CONFLICT(user_id, usage_date)
-                DO UPDATE SET successful_count = successful_count + 1
+                UPDATE usage
+                SET reserved_count = CASE WHEN reserved_count > 0 THEN reserved_count - 1 ELSE 0 END,
+                    successful_count = successful_count + 1
+                WHERE user_id = ? AND usage_date = ?
+                """,
+                (user_id, usage_date),
+            )
+            await self.conn.commit()
+
+    async def release_slot(self, user_id: int, usage_date: str | None = None) -> None:
+        usage_date = usage_date or date.today().isoformat()
+        assert self.conn is not None
+        async with self.lock:
+            await self.conn.execute(
+                """
+                UPDATE usage
+                SET reserved_count = CASE WHEN reserved_count > 0 THEN reserved_count - 1 ELSE 0 END
+                WHERE user_id = ? AND usage_date = ?
                 """,
                 (user_id, usage_date),
             )
@@ -177,6 +209,14 @@ class Database:
                 ),
             )
             await self.conn.commit()
+
+    async def get_last_ai_error(self) -> str | None:
+        row = await self._fetchone(
+            "SELECT created_at, telegram_name, user_id, error_text FROM ai_logs WHERE error_text IS NOT NULL ORDER BY id DESC LIMIT 1"
+        )
+        if not row:
+            return None
+        return f"{row['created_at']} | {row['telegram_name']}|{row['user_id']} | {row['error_text']}"
 
     async def export_logs_markdown(self) -> str:
         assert self.conn is not None
