@@ -1,9 +1,17 @@
 import asyncio
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
+
+
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
+
+def moscow_date() -> str:
+    return datetime.now(MOSCOW_TZ).date().isoformat()
 
 
 class Database:
@@ -112,7 +120,7 @@ class Database:
             await self.conn.commit()
 
     async def get_successful_count(self, user_id: int, usage_date: str | None = None) -> int:
-        usage_date = usage_date or date.today().isoformat()
+        usage_date = usage_date or moscow_date()
         row = await self._fetchone(
             """
             SELECT successful_count FROM usage
