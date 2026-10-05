@@ -111,15 +111,20 @@ async def admin_status(callback: CallbackQuery, db: Database) -> None:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
 
-    limit = await db.get_limit(settings.admin_id, settings.default_daily_limit)
+    limit = await db.get_limit(-1, settings.default_daily_limit)
     logs = await db.count_logs()
+    last_error = await db.get_last_ai_error()
+    api_status = (
+        f"🔴 Последняя ошибка API:\n<code>{last_error}</code>"
+        if last_error
+        else "🟢 Ошибок API в журнале нет."
+    )
     await callback.answer()
     await callback.message.answer(
         "🟢 <b>Бот жив</b>\n"
-        "🧠 AI API: доступен для вызовов\n"
-        f"📏 Текущий общий лимит: <b>{limit}</b>\n"
-        f"📝 Записей AI-журнала: <b>{logs}</b>\n"
-        "ℹ️ Последняя ошибка API хранится в журнале обращений, если она произошла."
+        f"{api_status}\n"
+        f"📏 Общий лимит: <b>{limit}</b>\n"
+        f"📝 Записей AI-журнала: <b>{logs}</b>"
     )
 
 
@@ -233,7 +238,7 @@ async def complaint_handler(message: Message, bot, db: Database) -> None:
 
     if not admin:
         limit = await db.get_limit(user.id, settings.default_daily_limit)
-        if not await db.try_reserve_slot(user.id, limit, today):
+        if not await db.reserve_slot(user.id, limit, today):
             count = await db.get_successful_count(user.id, today)
             await message.answer(
                 f"❌ Дневной лимит исчерпан: <b>{count}/{limit}</b>. "
@@ -277,11 +282,14 @@ async def complaint_handler(message: Message, bot, db: Database) -> None:
         # Лимит считается именно по успешным обращениям, а не по попыткам.
         # Для админа счётчик намеренно не увеличивается.
         if not admin:
-            await db.increment_successful(user.id, today)
+            await db.finalize_success(user.id, today)
 
         await status.edit_text(response)
     except Exception as exc:
         logger.exception("AI request failed for user %s", user.id)
+        if reserved:
+            await db.release_slot(user.id, today)
+
         await db.log_ai_call(
             user_id=user.id,
             telegram_name=user.full_name,
