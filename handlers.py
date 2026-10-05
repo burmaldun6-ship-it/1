@@ -235,10 +235,12 @@ async def complaint_handler(message: Message, bot, db: Database) -> None:
 
     admin = user.id == settings.admin_id
     today = date.today().isoformat()
+    reserved = False
 
     if not admin:
         limit = await db.get_limit(user.id, settings.default_daily_limit)
-        if not await db.reserve_slot(user.id, limit, today):
+        reserved = await db.reserve_slot(user.id, limit, today)
+        if not reserved:
             count = await db.get_successful_count(user.id, today)
             await message.answer(
                 f"❌ Дневной лимит исчерпан: <b>{count}/{limit}</b>. "
@@ -260,7 +262,7 @@ async def complaint_handler(message: Message, bot, db: Database) -> None:
         if image is None:
             raise RuntimeError("Не удалось скачать изображение из Telegram.")
 
-        image_bytes = image.getvalue() if isinstance(image, BytesIO) else bytes(image)
+        image_bytes = image.getvalue() if isinstance(image, BytesIO) else image.read()
 
         ai = AIService(
             api_key=settings.openai_api_key,
@@ -281,10 +283,12 @@ async def complaint_handler(message: Message, bot, db: Database) -> None:
 
         # Лимит считается именно по успешным обращениям, а не по попыткам.
         # Для админа счётчик намеренно не увеличивается.
-        if not admin:
+        if reserved:
             await db.finalize_success(user.id, today)
 
-        await status.edit_text(response)
+        await status.delete()
+        for offset in range(0, len(response), 4000):
+            await message.answer(response[offset : offset + 4000])
     except Exception as exc:
         logger.exception("AI request failed for user %s", user.id)
         if reserved:
